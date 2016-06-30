@@ -670,10 +670,12 @@ static int read_ber(struct dvb_frontend *fe, u32 *ber)
 	default:
 		break;
 	}
+#if 0
 	pr_info("mxl5xx: ber %08x %08x %08x %08x %08x %08x %08x\n",
 		reg[0], reg[1], reg[2], reg[3], reg[4], reg[5], reg[6]);
 	pr_info("mxl5xx: ber2 %08x %08x %08x %08x\n",
 		reg[0], reg[1], reg[2], reg[3]);
+#endif
         //pre_bit_error, pre_bit_count
 	//post_bit_error, post_bit_count;
 	//block_error block_count;
