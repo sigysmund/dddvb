@@ -92,7 +92,7 @@
 #include "mxl5xx.h"
 
 #define DDB_MAX_I2C    16
-#define DDB_MAX_PORT   16
+#define DDB_MAX_PORT   32
 #define DDB_MAX_INPUT  44
 #define DDB_MAX_OUTPUT 10
 #define DDB_MAX_LINK    4
