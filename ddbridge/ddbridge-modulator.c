@@ -1,7 +1,7 @@
 /*
- * ddbridge.c: Digital Devices PCIe bridge driver
+ * ddbridge-modulator.c: Digital Devices modulator cards
  *
- * Copyright (C) 2010-2015 Digital Devices GmbH
+ * Copyright (C) 2010-2017 Digital Devices GmbH
  *                         Marcus Metzler <mocm@metzlerbros.de>
  *                         Ralph Metzler <rjkm@metzlerbros.de>
  *
@@ -17,16 +17,19 @@
  *
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA
- * Or, point your browser to http://www.gnu.org/copyleft/gpl.html
+ * along with this program; if not, point your browser to
+ * http://www.gnu.org/copyleft/gpl.html
  */
 
 #include "ddbridge.h"
-#include "ddbridge-regs.h"
+#include "ddbridge-io.h"
 
 #include <linux/dvb/mod.h>
+#include <linux/gcd.h>
+
+/****************************************************************************/
+/****************************************************************************/
+/****************************************************************************/
 
 inline s64 ConvertPCR(s64 a)
 {
@@ -72,6 +75,28 @@ inline s64 RoundPCRDown(s64 a)
 	return a & ~(HW_LSB_MASK - 1);
 }
 
+/****************************************************************************/
+/****************************************************************************/
+/****************************************************************************/
+
+static int mod_SendChannelCommand(struct ddb *dev, u32 Channel, u32 Command)
+{
+	u32 ControlReg = ddbreadl(dev, CHANNEL_CONTROL(Channel));
+
+	ControlReg = (ControlReg & ~CHANNEL_CONTROL_CMD_MASK)|Command;
+	ddbwritel(dev, ControlReg, CHANNEL_CONTROL(Channel));
+	while (1) {
+		ControlReg = ddbreadl(dev, CHANNEL_CONTROL(Channel));
+		if (ControlReg == 0xFFFFFFFF)
+			return -EIO;
+		if ((ControlReg & CHANNEL_CONTROL_CMD_STATUS) == 0)
+			break;
+	}
+	if (ControlReg & CHANNEL_CONTROL_ERROR_CMD)
+		return -EINVAL;
+	return 0;
+}
+
 static int mod_busy(struct ddb *dev, int chan)
 {
 	u32 creg;
@@ -89,11 +114,14 @@ static int mod_busy(struct ddb *dev, int chan)
 void ddbridge_mod_output_stop(struct ddb_output *output)
 {
 	struct ddb *dev = output->port->dev;
-	struct mod_state *mod = &dev->mod[output->nr];
+	struct ddb_mod *mod = &dev->mod[output->nr];
 
 	mod->State = CM_IDLE;
-	mod->Control = 0;
-	ddbwritel(dev, 0, CHANNEL_CONTROL(output->nr));
+	mod->Control &= 0xfffffff0;
+	if (dev->link[0].info->version == 2)
+		mod_SendChannelCommand(dev, output->nr,
+				       CHANNEL_CONTROL_CMD_FREE);
+	ddbwritel(dev, mod->Control, CHANNEL_CONTROL(output->nr));
 #if 0
 	udelay(10);
 	ddbwritel(dev, CHANNEL_CONTROL_RESET, CHANNEL_CONTROL(output->nr));
@@ -101,14 +129,14 @@ void ddbridge_mod_output_stop(struct ddb_output *output)
 	ddbwritel(dev, 0, CHANNEL_CONTROL(output->nr));
 #endif
 	mod_busy(dev, output->nr);
-	pr_info("mod_output_stop %d.%d\n", dev->nr, output->nr);
+	dev_info(dev->dev, "mod_output_stop %d.%d\n", dev->nr, output->nr);
 }
 
 static void mod_set_incs(struct ddb_output *output)
 {
 	s64 pcr;
 	struct ddb *dev = output->port->dev;
-	struct mod_state *mod = &dev->mod[output->nr];
+	struct ddb_mod *mod = &dev->mod[output->nr];
 
 	pcr = ConvertPCR(mod->PCRIncrement);
 	ddbwritel(dev,	pcr & 0xffffffff,
@@ -132,15 +160,140 @@ static void mod_set_rateinc(struct ddb *dev, u32 chan)
 	mod_busy(dev, chan);
 }
 
+static void mod_calc_rateinc(struct ddb_mod *mod)
+{
+	u32 ri;
+
+	dev_info(mod->port->dev->dev,
+		 "ibitrate %llu\n", mod->ibitrate);
+	dev_info(mod->port->dev->dev,
+		 "obitrate %llu\n", mod->obitrate);
+
+	if (mod->ibitrate != 0) {
+		u64 d = mod->obitrate - mod->ibitrate;
+
+		d = div64_u64(d, mod->obitrate >> 24);
+		if (d > 0xfffffe)
+			ri = 0xfffffe;
+		else
+			ri = d;
+	} else
+		ri = 0;
+	mod->rate_inc = ri;
+	dev_info(mod->port->dev->dev,
+		 "ibr=%llu, obr=%llu, ri=0x%06x\n",
+		 mod->ibitrate >> 32, mod->obitrate >> 32, ri);
+}
+
+static int mod_calc_obitrate(struct ddb_mod *mod)
+{
+	u64 ofac;
+
+	ofac = (((u64) mod->symbolrate) << 32) * 188;
+	ofac = div_u64(ofac, 204);
+	mod->obitrate = ofac * (mod->modulation + 3);
+	return 0;
+}
+
+static int mod_set_symbolrate(struct ddb_mod *mod, u32 srate)
+{
+	struct ddb *dev = mod->port->dev;
+
+	if (srate < 1000000)
+		return -EINVAL;
+	if (dev->link[0].info->version < 2) {
+		if (srate != 6900000)
+			return -EINVAL;
+	} else {
+		if (srate > 7100000)
+			return -EINVAL;
+	}
+	mod->symbolrate = srate;
+	mod_calc_obitrate(mod);
+	return 0;
+}
+
 static u32 qamtab[6] = { 0x000, 0x600, 0x601, 0x602, 0x903, 0x604 };
 
-void ddbridge_mod_output_start(struct ddb_output *output)
+static int mod_set_modulation(struct ddb_mod *mod,
+			      enum fe_modulation modulation)
+{
+	struct ddb *dev = mod->port->dev;
+
+	if (modulation > QAM_256 || modulation < QAM_16)
+		return -EINVAL;
+	mod->modulation = modulation;
+	if (dev->link[0].info->version < 2)
+		ddbwritel(dev, qamtab[modulation],
+			  CHANNEL_SETTINGS(mod->port->nr));
+	mod_calc_obitrate(mod);
+	return 0;
+}
+
+static int mod_set_frequency(struct ddb_mod *mod, u32 frequency)
+{
+	u32 freq = frequency / 1000000;
+
+	if (frequency % 1000000)
+		return -EINVAL;
+	if ((freq - 114) % 8)
+		return -EINVAL;
+	if ((freq < 114) || (freq > 874))
+		return -EINVAL;
+	mod->frequency = frequency;
+	return 0;
+}
+
+static int mod_set_ibitrate(struct ddb_mod *mod, u64 ibitrate)
+{
+	if (ibitrate > mod->obitrate)
+		return -EINVAL;
+	mod->ibitrate = ibitrate;
+	mod_calc_rateinc(mod);
+	return 0;
+}
+
+/* Calculating KF, LF from Symbolrate
+ *
+ *  Symbolrate is usually calculated as (M/N) * 10.24 MS/s
+ *
+ *   Common Values for M,N
+ *     J.83 Annex A,
+ *     Euro Docsis  6.952 MS/s : M =   869, N =  1280
+ *                  6.900 MS/s : M =   345, N =   512
+ *                  6.875 MS/s : M =  1375, N =  2048
+ *                  6.111 MS/s : M =  6111, N = 10240
+ *     J.83 Annex B **
+ *      QAM64       5.056941   : M =   401, N =   812
+ *      QAM256      5.360537   : M =    78, N =   149
+ *     J.83 Annex C **
+ *                  5.309734   : M =  1889, N =  3643
+ *
+ *    For the present hardware
+ *      KF' = 256 * M
+ *      LF' = 225 * N
+ *       or
+ *      KF' = Symbolrate in Hz
+ *      LF' = 9000000
+ *
+ *      KF  = KF' / gcd(KF',LF')
+ *      LF  = LF' / gcd(KF',LF')
+ * Note: LF must not be a power of 2.
+ *       Maximum value for KF,LF = 13421727 ( 0x7FFFFFF )
+ *    ** using these M,N values will result in a small err (<5ppm)
+ *       calculating KF,LF directly gives the exact normative result
+ *       but with rather large KF,LF values
+ */
+
+int ddbridge_mod_output_start(struct ddb_output *output)
 {
 	struct ddb *dev = output->port->dev;
-	struct mod_state *mod = &dev->mod[output->nr];
+	u32 Channel = output->nr;
+	struct ddb_mod *mod = &dev->mod[output->nr];
+	u32 Symbolrate = mod->symbolrate;
 
-	/*PCRIncrement = RoundPCR(PCRIncrement);*/
-	/*PCRDecrement = RoundPCR(PCRDecrement);*/
+	if (dev->link[0].info->version < 3)
+		mod_calc_rateinc(mod);
 
 	mod->LastInPacketCount = 0;
 	mod->LastOutPacketCount = 0;
@@ -158,25 +311,212 @@ void ddbridge_mod_output_start(struct ddb_output *output)
 	mod->State = CM_STARTUP;
 	mod->StateCounter = CM_STARTUP_DELAY;
 
-	ddbwritel(dev, 0, CHANNEL_CONTROL(output->nr));
+	if (dev->link[0].info->version == 3)
+		mod->Control = 0xfffffff0 &
+			ddbreadl(dev, CHANNEL_CONTROL(output->nr));
+	else
+		mod->Control = 0;
+	ddbwritel(dev, mod->Control, CHANNEL_CONTROL(output->nr));
 	udelay(10);
-	ddbwritel(dev, CHANNEL_CONTROL_RESET, CHANNEL_CONTROL(output->nr));
+	ddbwritel(dev, mod->Control | CHANNEL_CONTROL_RESET,
+		  CHANNEL_CONTROL(output->nr));
 	udelay(10);
-	ddbwritel(dev, 0, CHANNEL_CONTROL(output->nr));
+	ddbwritel(dev, mod->Control, CHANNEL_CONTROL(output->nr));
 
-	/* QAM: 600 601 602 903 604 = 16 32 64 128 256 */
-	/* ddbwritel(dev, 0x604, CHANNEL_SETTINGS(output->nr)); */
-	ddbwritel(dev, qamtab[mod->modulation], CHANNEL_SETTINGS(output->nr));
+	if (dev->link[0].info->version == 2) {
+		u32 Output = (mod->frequency - 114000000) / 8000000;
+		u32 KF = Symbolrate;
+		u32 LF = 9000000UL;
+		u32 d = gcd(KF, LF);
+		u32 checkLF;
 
-	mod_set_rateinc(dev, output->nr);
-	mod_set_incs(output);
+		ddbwritel(dev, mod->modulation - 1, CHANNEL_SETTINGS(Channel));
+		ddbwritel(dev, Output, CHANNEL_SETTINGS2(Channel));
 
-	mod->Control = (CHANNEL_CONTROL_ENABLE_IQ |
-			CHANNEL_CONTROL_ENABLE_DVB |
-			CHANNEL_CONTROL_ENABLE_SOURCE);
+		KF = KF / d;
+		LF = LF / d;
+
+		while ((KF > KFLF_MAX) || (LF > KFLF_MAX)) {
+			KF >>= 1;
+			LF >>= 1;
+		}
+
+		checkLF = LF;
+		while ((checkLF & 1) == 0)
+			checkLF >>= 1;
+		if (checkLF <= 1)
+			return -EINVAL;
+
+		dev_info(dev->dev, "KF=%u LF=%u Output=%u mod=%u\n",
+			 KF, LF, Output, mod->modulation);
+		ddbwritel(dev, KF, CHANNEL_KF(Channel));
+		ddbwritel(dev, LF, CHANNEL_LF(Channel));
+
+		if (mod_SendChannelCommand(dev, Channel,
+					   CHANNEL_CONTROL_CMD_SETUP))
+			return -EINVAL;
+		mod->Control |= CHANNEL_CONTROL_ENABLE_DVB;
+	} else if (dev->link[0].info->version <= 1) {
+		/* QAM: 600 601 602 903 604 = 16 32 64 128 256 */
+		/* ddbwritel(dev, 0x604, CHANNEL_SETTINGS(output->nr)); */
+		ddbwritel(dev, qamtab[mod->modulation],
+			  CHANNEL_SETTINGS(output->nr));
+		mod->Control |= (CHANNEL_CONTROL_ENABLE_IQ |
+				 CHANNEL_CONTROL_ENABLE_DVB);
+	} else if (dev->link[0].info->version == 3) {
+		mod->Control |= (CHANNEL_CONTROL_ENABLE_IQ |
+				 CHANNEL_CONTROL_ENABLE_DVB);
+	}
+	if (dev->link[0].info->version < 3) {
+		mod_set_rateinc(dev, output->nr);
+		mod_set_incs(output);
+	}
+	mod->Control |= CHANNEL_CONTROL_ENABLE_SOURCE;
 
 	ddbwritel(dev, mod->Control, CHANNEL_CONTROL(output->nr));
-	pr_info("mod_output_start %d.%d\n", dev->nr, output->nr);
+	if (dev->link[0].info->version == 2)
+		if (mod_SendChannelCommand(dev, Channel,
+					   CHANNEL_CONTROL_CMD_UNMUTE))
+			return -EINVAL;
+	dev_info(dev->dev, "mod_output_start %d.%d ctrl=%08x\n",
+		 dev->nr, output->nr, mod->Control);
+	return 0;
+}
+
+/****************************************************************************/
+/****************************************************************************/
+/****************************************************************************/
+
+static int mod_write_max2871(struct ddb *dev, u32 val)
+{
+	ddbwritel(dev, val, MAX2871_OUTDATA);
+	ddbwritel(dev, MAX2871_CONTROL_CE | MAX2871_CONTROL_WRITE,
+		  MAX2871_CONTROL);
+	while (1) {
+		u32 ControlReg = ddbreadl(dev, MAX2871_CONTROL);
+
+		if (ControlReg == 0xFFFFFFFF)
+			return -EIO;
+		if ((ControlReg & MAX2871_CONTROL_WRITE) == 0)
+			break;
+	}
+	return 0;
+}
+
+static u32 max2871_fsm[6] = {
+	0x00730040, 0x600080A1, 0x510061C2, 0x010000CB, 0x6199003C, 0x60440005,
+};
+
+static u32 max2871_sdr[6] = {
+	0x007A8098, 0x600080C9, 0x510061C2, 0x010000CB, 0x6199003C, 0x60440005
+};
+
+static void lostlock_handler(void *data)
+{
+	struct ddb *dev = (struct ddb *)data;
+
+	dev_err(dev->dev, "Lost PLL lock!\n");
+	ddbwritel(dev, 0, RF_VGA);
+	udelay(10);
+	ddbwritel(dev, 31, RF_ATTENUATOR);
+}
+
+static int mod_setup_max2871(struct ddb *dev, u32 *reg)
+{
+	int status = 0;
+	int i, j;
+	u32 val;
+
+	ddbwritel(dev, MAX2871_CONTROL_CE, MAX2871_CONTROL);
+	msleep(30);
+	for (i = 0; i < 2; i++) {
+		for (j = 5; j >= 0; j--) {
+			val = reg[j];
+
+			if (j == 4)
+				val &= 0xFFFFFEDF;
+			status = mod_write_max2871(dev, reg[j]);
+			if (status)
+				break;
+			msleep(30);
+		}
+	}
+	if (status == 0) {
+		u32 ControlReg;
+
+		if (reg[3] & (1 << 24))
+			msleep(100);
+		ControlReg = ddbreadl(dev, MAX2871_CONTROL);
+
+		if ((ControlReg & MAX2871_CONTROL_LOCK) == 0)
+			status = -EIO;
+		status = mod_write_max2871(dev, reg[4]);
+		ddbwritel(dev,
+			  MAX2871_CONTROL_CE | MAX2871_CONTROL_LOSTLOCK,
+			  MAX2871_CONTROL);
+		if (dev->link[0].info->lostlock_irq)
+			ddb_irq_set(dev, 0, dev->link[0].info->lostlock_irq,
+				    lostlock_handler, dev);
+	}
+	return status;
+}
+
+static int mod_fsm_setup(struct ddb *dev, u32 MaxUsedChannels)
+{
+	int status = 0;
+	u32 Capacity;
+	u32 tmp = ddbreadl(dev, FSM_STATUS);
+
+	status = mod_setup_max2871(dev, max2871_fsm);
+	if (status)
+		return status;
+	ddbwritel(dev, FSM_CMD_RESET, FSM_CONTROL);
+	msleep(20);
+
+	tmp = ddbreadl(dev, FSM_STATUS);
+	if ((tmp & FSM_STATUS_READY) == 0)
+		return -1;
+
+	Capacity = ddbreadl(dev, FSM_CAPACITY);
+	if (((tmp & FSM_STATUS_QAMREADY) != 0) &&
+	    ((Capacity & FSM_CAPACITY_INUSE) != 0))
+		return -EBUSY;
+
+	ddbwritel(dev, FSM_CMD_SETUP, FSM_CONTROL);
+	msleep(20);
+	tmp = ddbreadl(dev, FSM_STATUS);
+
+	if ((tmp & FSM_STATUS_QAMREADY) == 0)
+		return -1;
+
+	if (MaxUsedChannels == 0)
+		MaxUsedChannels = (Capacity & FSM_CAPACITY_CUR) >> 16;
+
+	if (MaxUsedChannels <= 1)
+		ddbwritel(dev, FSM_GAIN_N1, FSM_GAIN);
+	else if (MaxUsedChannels <= 2)
+		ddbwritel(dev, FSM_GAIN_N2, FSM_GAIN);
+	else if (MaxUsedChannels <= 4)
+		ddbwritel(dev, FSM_GAIN_N4, FSM_GAIN);
+	else if (MaxUsedChannels <= 8)
+		ddbwritel(dev, FSM_GAIN_N8, FSM_GAIN);
+	else if (MaxUsedChannels <= 16)
+		ddbwritel(dev, FSM_GAIN_N16, FSM_GAIN);
+	else if (MaxUsedChannels <= 24)
+		ddbwritel(dev, FSM_GAIN_N24, FSM_GAIN);
+	else
+		ddbwritel(dev, FSM_GAIN_N96, FSM_GAIN);
+
+	ddbwritel(dev, FSM_CONTROL_ENABLE, FSM_CONTROL);
+	return status;
+}
+
+static int mod_set_vga(struct ddb *dev, u32 Gain)
+{
+	if (Gain > 255)
+		return -EINVAL;
+	ddbwritel(dev, Gain, RF_VGA);
+	return 0;
 }
 
 /****************************************************************************/
@@ -329,8 +669,8 @@ static int mod_set_si598(struct ddb *dev, u32 freq)
 		mod_si598_readreg(dev, 11, &Data[4]);
 		mod_si598_readreg(dev, 12, &Data[5]);
 
-		pr_info(" Data = %02x %02x %02x %02x %02x %02x\n",
-			Data[0], Data[1], Data[2], Data[3], Data[4], Data[5]);
+		dev_info(dev->dev, "Data = %02x %02x %02x %02x %02x %02x\n",
+			 Data[0], Data[1], Data[2], Data[3], Data[4], Data[5]);
 		RFreq = (((u64)Data[1] & 0x3F) << 32) | ((u64)Data[2] << 24) |
 			((u64)Data[3] << 16) | ((u64)Data[4] << 8) |
 			((u64)Data[5]);
@@ -343,13 +683,14 @@ static int mod_set_si598(struct ddb *dev, u32 freq)
 		     ((u32)(Data[1] & 0xE0) >> 6)) + 1;
 		fDCO = fOut * (u64)(HSDiv * N);
 		m_fXtal = fDCO << 28;
-		pr_info("fxtal %016llx  rfreq %016llx\n", m_fXtal, RFreq);
+		dev_info(dev->dev, "fxtal %016llx  rfreq %016llx\n",
+			 m_fXtal, RFreq);
 
 		m_fXtal += RFreq >> 1;
 		m_fXtal = div64_u64(m_fXtal, RFreq);
 
-		pr_info("fOut = %d fXtal = %d fDCO = %d HDIV = %2d, N = %3d\n",
-			(u32) fOut, (u32) m_fXtal, (u32) fDCO, (u32) HSDiv, N);
+		dev_info(dev->dev, "fOut = %d fXtal = %d fDCO = %d HDIV = %2d, N = %3d\n",
+			 (u32) fOut, (u32) m_fXtal, (u32) fDCO, (u32) HSDiv, N);
 	}
 
 	fOut = freq;
@@ -359,8 +700,8 @@ static int mod_set_si598(struct ddb *dev, u32 freq)
 
 	if (Div < MinDiv)
 		Div = Div + 1;
-	pr_info(" fOut = %u MinDiv = %llu MaxDiv = %llu StartDiv = %llu\n",
-		fOut, MinDiv, MaxDiv, Div);
+	dev_info(dev->dev, "fOut = %u MinDiv = %llu MaxDiv = %llu StartDiv = %llu\n",
+		 fOut, MinDiv, MaxDiv, Div);
 
 	if (Div <= 11) {
 		N = 1;
@@ -378,8 +719,8 @@ static int mod_set_si598(struct ddb *dev, u32 freq)
 				if (N > 128)
 					break;
 			}
-			pr_info(" %3d: %llu %llu %llu %u\n",
-				retry, Div, HSDiv * N, HSDiv, N);
+			dev_info(dev->dev, "%3d: %llu %llu %llu %u\n",
+				 retry, Div, HSDiv * N, HSDiv, N);
 			if (HSDiv * N < MinDiv)
 				Div = Div + 2;
 			else if (HSDiv * N > MaxDiv)
@@ -389,7 +730,7 @@ static int mod_set_si598(struct ddb *dev, u32 freq)
 			retry = retry - 1;
 		}
 		if (retry == 0) {
-			pr_err(" FAIL\n");
+			dev_err(dev->dev, "FAIL\n");
 			return -EINVAL;
 		}
 	}
@@ -404,17 +745,17 @@ static int mod_set_si598(struct ddb *dev, u32 freq)
 
 
 	fDCO = (u64)fOut * (u64)N * (u64)HSDiv;
-	pr_info("fdco %16llx\n", fDCO);
+	dev_info(dev->dev, "fdco %16llx\n", fDCO);
 	RFreq = fDCO<<28;
-	pr_info("%16llx %16llx\n", fDCO, RFreq);
+	dev_info(dev->dev, "%16llx %16llx\n", fDCO, RFreq);
 
 	fxtal = m_fXtal;
 	do_div(RFreq, fxtal);
-	pr_info("%16llx %d\n", RFreq, fxtal);
+	dev_info(dev->dev, "%16llx %d\n", RFreq, fxtal);
 	RF = RFreq;
 
-	pr_info("fOut = %u fXtal = %llu fDCO = %llu HSDIV = %llu, N = %u, RFreq = %llu\n",
-		fOut, m_fXtal, fDCO, HSDiv, N, RFreq);
+	dev_info(dev->dev, "fOut = %u fXtal = %llu fDCO = %llu HSDIV = %llu, N = %u, RFreq = %llu\n",
+		 fOut, m_fXtal, fDCO, HSDiv, N, RFreq);
 
 	Data[0] = (u8)(((HSDiv - 4) << 5) | ((N - 1) >> 2));
 	Data[1] = (u8)((((N - 1) & 0x03) << 6) | ((RF >> 32) & 0x3F));
@@ -423,8 +764,8 @@ static int mod_set_si598(struct ddb *dev, u32 freq)
 	Data[4] = (u8)((RF >>  8) & 0xFF);
 	Data[5] = (u8)((RF)       & 0xFF);
 
-	pr_info(" Data = %02x %02x %02x %02x %02x %02x\n",
-		Data[0], Data[1], Data[2], Data[3], Data[4], Data[5]);
+	dev_info(dev->dev, "Data = %02x %02x %02x %02x %02x %02x\n",
+		 Data[0], Data[1], Data[2], Data[3], Data[4], Data[5]);
 	mod_si598_writereg(dev, 7, Data[0]);
 	mod_si598_writereg(dev, 8, Data[1]);
 	mod_si598_writereg(dev, 9, Data[2]);
@@ -544,9 +885,9 @@ static int mod_init_dac_input(struct ddb *dev)
 	Seek = 1;
 	for (Sample = 0; Sample < 32; Sample += 1) {
 		/* printk(" %2d: %d %2d %2d\n",
-		   Sample, SeekTable[Sample], SetTable[Sample],
-		   HldTable[Sample]);
-		*/
+		 * Sample, SeekTable[Sample], SetTable[Sample],
+		 * HldTable[Sample]);
+		 */
 
 		if (Sample1 == 0xFF && SeekTable[Sample] == 1 && Seek == 0)
 			Sample1 = Sample;
@@ -557,11 +898,11 @@ static int mod_init_dac_input(struct ddb *dev)
 	}
 
 	if (Sample1 == 0xFF || Sample2 == 0xFF) {
-		pr_err(" No valid window found\n");
+		dev_err(dev->dev, "No valid window found\n");
 		return -EINVAL;
 	}
 
-	pr_err(" Window = %d - %d\n", Sample1, Sample2);
+	dev_err(dev->dev, "Window = %d - %d\n", Sample1, Sample2);
 
 	for (Sample = Sample1; Sample < Sample2; Sample += 1) {
 		if (SetTable[Sample] < HldTable[Sample]) {
@@ -572,15 +913,15 @@ static int mod_init_dac_input(struct ddb *dev)
 		}
 	}
 
-	pr_info("Select Sample %d\n", SelectSample);
+	dev_info(dev->dev, "Select Sample %d\n", SelectSample);
 
 	if (SelectSample == 0xFF) {
-		pr_err("No valid sample found\n");
+		dev_err(dev->dev, "No valid sample found\n");
 		return -EINVAL;
 	}
 
 	if (HldTable[SelectSample] + SetTable[SelectSample] < 8) {
-		pr_err("Too high jitter\n");
+		dev_err(dev->dev, "Too high jitter\n");
 		return -EINVAL;
 	}
 
@@ -595,10 +936,10 @@ static int mod_init_dac_input(struct ddb *dev)
 	mod_read_dac_register(dev, 0x06, &ReadSeek);
 	Seek &= ReadSeek;
 	if ((Seek & 0x01) == 0) {
-		pr_err("Insufficient timing margin\n");
+		dev_err(dev->dev, "Insufficient timing margin\n");
 		return -EINVAL;
 	}
-	pr_info("Done\n");
+	dev_info(dev->dev, "Done\n");
 	return 0;
 }
 
@@ -655,7 +996,7 @@ static int mod_set_dac_clock(struct ddb *dev, u32 Frequency)
 		ddbwritel(dev, DAC_CONTROL_RESET, DAC_CONTROL);
 		msleep(20);
 		if (mod_set_si598(dev, Frequency)) {
-			pr_err("mod_set_si598 failed\n");
+			dev_err(dev->dev, "mod_set_si598 failed\n");
 			return -1;
 		}
 		msleep(50);
@@ -670,7 +1011,7 @@ static int mod_set_dac_clock(struct ddb *dev, u32 Frequency)
 			break;
 		msleep(100);
 	}
-	pr_info("mod_set_dac_clock OK\n");
+	dev_info(dev->dev, "%s OK\n", __func__);
 	return hr;
 }
 
@@ -754,17 +1095,6 @@ u32 eqtab[] = {
 	0x00001B23, 0x0000EEB7, 0x00006A28
 };
 
-static int mod_set_modulation(struct ddb *dev, int chan, enum fe_modulation mod)
-{
-	if (mod > QAM_256 || mod < QAM_16)
-		return -EINVAL;
-	dev->mod[chan].modulation = mod;
-	dev->mod[chan].obitrate = 0x0061072787900000ULL * (mod + 3);
-	dev->mod[chan].ibitrate = dev->mod[chan].obitrate;
-	ddbwritel(dev, qamtab[mod], CHANNEL_SETTINGS(chan));
-	return 0;
-}
-
 static void mod_set_channelsumshift(struct ddb *dev, u32 shift)
 {
 	ddbwritel(dev, (shift & 3) << 2, MODULATOR_CONTROL);
@@ -787,24 +1117,24 @@ static int set_base_frequency(struct ddb *dev, u32 freq)
 	u32 UP2Frequency = 1896;
 	u32 down, freq10;
 
-	pr_info("set base to %u\n", freq);
+	dev_info(dev->dev, "set base to %u\n", freq);
 	dev->mod_base.frequency = freq;
 	freq /= 1000000;
 	freq10 = dev->mod_base.flat_start + 4;
 	down = freq + 9 * 8 + freq10 + UP1Frequency + UP2Frequency;
 
 	if ((freq10 + 9 * 8) > (dev->mod_base.flat_end - 4)) {
-		pr_err("Frequency out of range %d\n", freq10);
+		dev_err(dev->dev, "Frequency out of range %d\n", freq10);
 		return -EINVAL;
 	}
 	if (down % 8) {
-		pr_err(" Invalid Frequency %d\n", down);
+		dev_err(dev->dev, "Invalid Frequency %d\n", down);
 		return -EINVAL;
 	}
 	return mod_set_down(dev, down, 8, Ext);
 }
 
-static int mod_init(struct ddb *dev, u32 Frequency)
+static int mod_init_1(struct ddb *dev, u32 Frequency)
 {
 	int stat = 0;
 	u8 *buffer;
@@ -827,12 +1157,12 @@ static int mod_init(struct ddb *dev, u32 Frequency)
 		stat = -EINVAL;
 		goto fail;
 	}
-	pr_info("srate = %d\n", flash->DataSet[0].Symbolrate * 1000);
+	dev_info(dev->dev, "srate = %d\n", flash->DataSet[0].Symbolrate * 1000);
 
 	mod_output_enable(dev, 0);
 	stat = mod_set_dac_clock(dev, flash->DataSet[0].DACFrequency * 1000);
 	if (stat < 0) {
-		pr_err("setting DAC clock failed\n");
+		dev_err(dev->dev, "setting DAC clock failed\n");
 		goto fail;
 	}
 	mod_set_dac_current(dev, 512, 512);
@@ -849,16 +1179,17 @@ static int mod_init(struct ddb *dev, u32 Frequency)
 	FrequencyCH10 = flash->DataSet[0].FlatStart + 4;
 	DownFrequency = Frequency + 9 * 8 + FrequencyCH10 +
 		UP1Frequency + UP2Frequency;
-	pr_info("CH10 = %d, Down = %d\n", FrequencyCH10, DownFrequency);
+	dev_info(dev->dev, "CH10 = %d, Down = %d\n",
+		 FrequencyCH10, DownFrequency);
 
 	if ((FrequencyCH10 + 9 * 8) > (flash->DataSet[0].FlatEnd - 4)) {
-		pr_err("Frequency out of range %d\n", FrequencyCH10);
+		dev_err(dev->dev, "Frequency out of range %d\n", FrequencyCH10);
 		stat = -EINVAL;
 		goto fail;
 	}
 
 	if (DownFrequency % 8 != 0) {
-		pr_err(" Invalid Frequency %d\n", DownFrequency);
+		dev_err(dev->dev, "Invalid Frequency %d\n", DownFrequency);
 		stat = -EINVAL;
 		goto fail;
 	}
@@ -866,13 +1197,18 @@ static int mod_init(struct ddb *dev, u32 Frequency)
 	mod_set_down(dev, DownFrequency, 8, Ext);
 
 	for (i = 0; i < 10; i++) {
+		struct ddb_mod *mod = &dev->mod[i];
+
+		mod->port = &dev->port[i];
 		ddbwritel(dev, 0, CHANNEL_CONTROL(i));
 
 		iqfreq = flash->DataSet[0].FrequencyFactor *
 			(FrequencyCH10 + (9 - i) * 8);
+		iqfreq += (dev->link[0].ids.hwid == 0x0203dd01) ? 22 : 0;
 		iqsteps = flash->DataSet[0].IQTableLength;
 		mod_set_iq(dev, iqsteps, i, iqfreq);
-		mod_set_modulation(dev, i, QAM_256);
+		mod_set_modulation(mod, QAM_256);
+		mod_set_symbolrate(mod, 6900000);
 	}
 
 	mod_bypass_equalizer(dev, 1);
@@ -882,7 +1218,7 @@ static int mod_init(struct ddb *dev, u32 Frequency)
 			 flash->DataSet[0].PostScaleQ);
 	mod_pre_eq_gain(dev, flash->DataSet[0].PreScale);
 	/*mod_pre_eq_gain(dev, 0x0680);*/
-	pr_info("prescaler %04x\n", flash->DataSet[0].PreScale);
+	dev_info(dev->dev, "prescaler %04x\n", flash->DataSet[0].PreScale);
 	mod_set_channelsumshift(dev, 2);
 	mod_output_enable(dev, 1);
 
@@ -896,17 +1232,17 @@ fail:
 #define FACTOR         (1ULL << 22)
 
 /*
-  double Increment =  FACTOR*PACKET_CLOCKS/double(m_OutputBitrate);
-  double Decrement =  FACTOR*PACKET_CLOCKS/double(m_InputBitrate);
-  27000000 * 1504 * 2^22 / (6900000 * 188 / 204) = 26785190066.1
-*/
+ * double Increment =  FACTOR*PACKET_CLOCKS/double(m_OutputBitrate);
+ * double Decrement =  FACTOR*PACKET_CLOCKS/double(m_InputBitrate);
+ * 27000000 * 1504 * 2^22 / (6900000 * 188 / 204) = 26785190066.1
+ */
 
-void ddbridge_mod_rate_handler(unsigned long data)
+void ddbridge_mod_rate_handler(void *data)
 {
 	struct ddb_output *output = (struct ddb_output *) data;
 	struct ddb_dma *dma = output->dma;
 	struct ddb *dev = output->port->dev;
-	struct mod_state *mod = &dev->mod[output->nr];
+	struct ddb_mod *mod = &dev->mod[output->nr];
 
 	u32 chan = output->nr;
 	u32 OutPacketCount;
@@ -1006,8 +1342,8 @@ void ddbridge_mod_rate_handler(unsigned long data)
 
 	case CM_ADJUST:
 		if (InPacketDiff < mod->MinInputPackets) {
-			pr_info("PCR Adjust reset  IN: %u  Min: %u\n",
-				InPacketDiff, mod->MinInputPackets);
+			dev_info(dev->dev, "PCR Adjust reset  IN: %u  Min: %u\n",
+				 InPacketDiff, mod->MinInputPackets);
 			mod->InPacketsSum = 0;
 			mod->OutPacketsSum = 0;
 			mod->PCRAdjustSum = 0;
@@ -1047,7 +1383,7 @@ void ddbridge_mod_rate_handler(unsigned long data)
 
 		mod->PCRIncrement += PCRIncrementDiff;
 		pcr = ConvertPCR(mod->PCRIncrement);
-		pr_info("outl %016llx\n", pcr);
+		dev_info(dev->dev, "outl %016llx\n", pcr);
 		ddbwritel(dev,	pcr & 0xffffffff,
 			  CHANNEL_PCR_ADJUST_OUTL(output->nr));
 		ddbwritel(dev,	(pcr >> 32) & 0xffffffff,
@@ -1074,11 +1410,175 @@ void ddbridge_mod_rate_handler(unsigned long data)
 
 	spin_unlock(&dma->lock);
 
-	pr_info("chan %d out %016llx in %016llx indiff %08x\n",
-		chan, OutPackets, InPackets, InPacketDiff);
-	pr_info("cnt  %d pcra %016llx pcraext %08x pcraextfrac %08x pcrcorr %08x pcri %016llx\n",
-		mod->StateCounter, PCRAdjust, PCRAdjustExt,
-		PCRAdjustExtFrac, PCRCorr, mod->PCRIncrement);
+	dev_info(dev->dev, "chan %d out %016llx in %016llx indiff %08x\n",
+		 chan, OutPackets, InPackets, InPacketDiff);
+	dev_info(dev->dev, "cnt  %d pcra %016llx pcraext %08x pcraextfrac %08x pcrcorr %08x pcri %016llx\n",
+		 mod->StateCounter, PCRAdjust, PCRAdjustExt,
+		 PCRAdjustExtFrac, PCRCorr, mod->PCRIncrement);
+}
+
+static int mod3_set_base_frequency(struct ddb *dev, u32 frequency)
+{
+	u64 tmp;
+
+	if (frequency % 1000)
+		return -EINVAL;
+	if ((frequency < 114000000) || (frequency > 874000000))
+		return -EINVAL;
+	dev->mod_base.frequency = frequency;
+	tmp = frequency;
+	tmp <<= 33;
+	tmp = div64_s64(tmp, 4915200000);
+	dev_info(dev->dev, "set base frequency = %u  regs = 0x%08llx\n", frequency, tmp);
+	ddbwritel(dev, (u32) tmp, RFDAC_FCW);
+	return 0;
+}
+
+static void mod3_set_cfcw(struct ddb_mod *mod, u32 f)
+{
+	struct ddb *dev = mod->port->dev;
+	s32 freq = f;
+	s32 dcf = dev->mod_base.frequency;
+	s64 tmp, srdac = 245760000;
+	u32 cfcw;
+
+	tmp = ((s64) (freq - dcf)) << 32;
+	tmp = div64_s64(tmp, srdac);
+	cfcw = (u32) tmp;
+	dev_info(dev->dev, "f=%u cfcw = %08x nr = %u\n", f, cfcw, mod->port->nr);
+	ddbwritel(dev, cfcw, SDR_CHANNEL_CFCW(mod->port->nr));
+}
+
+static int mod3_set_frequency(struct ddb_mod *mod, u32 frequency)
+{
+#if 0
+	struct ddb *dev = mod->port->dev;
+
+	if (frequency % 1000)
+		return -EINVAL;
+	if ((frequency < 114000000) || (frequency > 874000000))
+		return -EINVAL;
+	if (frequency > dev->mod_base.frequency)
+		if (frequency - dev->mod_base.frequency > 100000000)
+			return -EINVAL;
+	else
+		if (dev->mod_base.frequency - frequency > 100000000)
+			return -EINVAL;
+#endif
+	mod3_set_cfcw(mod, frequency);
+	return 0;
+}
+
+static int mod3_set_ari(struct ddb_mod *mod, u32 rate)
+{
+	ddbwritel(mod->port->dev, rate, SDR_CHANNEL_ARICW(mod->port->nr));
+	return 0;
+}
+
+
+static int mod3_prop_proc(struct ddb_mod *mod, struct dtv_property *tvp)
+{
+	switch (tvp->cmd) {
+	case MODULATOR_OUTPUT_ARI:
+		return mod3_set_ari(mod, tvp->u.data);
+
+	case MODULATOR_FREQUENCY:
+		return mod3_set_frequency(mod, tvp->u.data);
+
+	case MODULATOR_BASE_FREQUENCY:
+		return mod3_set_base_frequency(mod->port->dev, tvp->u.data);
+
+	case MODULATOR_ATTENUATOR:
+		return mod_set_attenuator(mod->port->dev, tvp->u.data);
+
+	case MODULATOR_GAIN:
+		return mod_set_vga(mod->port->dev, tvp->u.data);
+	}
+	return -EINVAL;
+}
+
+static int mod_prop_proc(struct ddb_mod *mod, struct dtv_property *tvp)
+{
+	if (mod->port->dev->link[0].info->version == 3)
+		return mod3_prop_proc(mod, tvp);
+	switch (tvp->cmd) {
+	case MODULATOR_SYMBOL_RATE:
+		return mod_set_symbolrate(mod, tvp->u.data);
+
+	case MODULATOR_MODULATION:
+		return mod_set_modulation(mod, tvp->u.data);
+
+	case MODULATOR_FREQUENCY:
+		return mod_set_frequency(mod, tvp->u.data);
+
+	case MODULATOR_ATTENUATOR:
+		return mod_set_attenuator(mod->port->dev, tvp->u.data);
+
+	case MODULATOR_INPUT_BITRATE:
+		return mod_set_ibitrate(mod, tvp->u.data64);
+
+	case MODULATOR_GAIN:
+		if (mod->port->dev->link[0].info->version == 2)
+			return mod_set_vga(mod->port->dev, tvp->u.data);
+		return -EINVAL;
+
+	case MODULATOR_RESET:
+		if (mod->port->dev->link[0].info->version == 2)
+			return mod_fsm_setup(mod->port->dev,0 );
+		return -EINVAL;
+
+	case MODULATOR_STATUS:
+		if (mod->port->dev->link[0].info->version != 2)
+			return -EINVAL;
+		if (tvp->u.data & 2)
+			ddbwritel(mod->port->dev,
+				  MAX2871_CONTROL_CE |
+				  MAX2871_CONTROL_LOSTLOCK |
+				  MAX2871_CONTROL_ENABLE_LOSTLOCK_EVENT,
+				  MAX2871_CONTROL);
+		return 0;
+	}
+	return 0;
+}
+
+static int mod_prop_get(struct ddb_mod *mod, struct dtv_property *tvp)
+{
+	struct ddb *dev = mod->port->dev;
+
+	if (mod->port->dev->link[0].info->version != 2)
+		return -1;
+	switch (tvp->cmd) {
+	case MODULATOR_GAIN:
+		tvp->u.data = 0xff & ddbreadl(dev, RF_VGA);;
+		return 0;
+
+	case MODULATOR_ATTENUATOR:
+		tvp->u.data = 0x1f & ddbreadl(dev, RF_ATTENUATOR);
+		return 0;
+
+	case MODULATOR_STATUS:
+	{
+		u32 status = 0, val;
+
+		val = ddbreadl(dev, MAX2871_CONTROL);
+		if (!(val & MAX2871_CONTROL_LOCK))
+			status |= 1;
+		if (val & MAX2871_CONTROL_LOSTLOCK)
+			status |= 2;
+		ddbwritel(dev, val, MAX2871_CONTROL);
+
+		val = ddbreadl(dev, TEMPMON_CONTROL);
+		if (val & TEMPMON_CONTROL_OVERTEMP)
+			status |= 4;
+		val = ddbreadl(dev, HARDWARE_VERSION);
+		if (val == 0xffffffff)
+			status |= 8;
+		tvp->u.data = status;
+		return 0;
+	}
+	default:
+		return -1;
+	}
 }
 
 int ddbridge_mod_do_ioctl(struct file *file, unsigned int cmd, void *parg)
@@ -1086,67 +1586,283 @@ int ddbridge_mod_do_ioctl(struct file *file, unsigned int cmd, void *parg)
 	struct dvb_device *dvbdev = file->private_data;
 	struct ddb_output *output = dvbdev->priv;
 	struct ddb *dev = output->port->dev;
+	struct ddb_mod *mod = &dev->mod[output->nr];
+	struct dtv_property *tvp = NULL;
+	struct dtv_properties *tvps =
+		(struct dtv_properties __user *) parg;
+	int i, ret = 0;
 
-	/* unsigned long arg = (unsigned long) parg; */
-	int ret = 0;
-
+	if (dev->link[0].info->version == 3 && cmd != FE_SET_PROPERTY)
+		return -EINVAL;
+	mutex_lock(&dev->ioctl_mutex);
 	switch (cmd) {
+	case FE_SET_PROPERTY:
+		if ((tvps->num == 0) || (tvps->num > DTV_IOCTL_MAX_MSGS)) {
+			ret = -EINVAL;
+			break;
+		}
+		tvp = memdup_user(tvps->props, tvps->num * sizeof(*tvp));
+		if (IS_ERR(tvp)) {
+			ret = PTR_ERR(tvp);
+			break;
+		}
+		for (i = 0; i < tvps->num; i++) {
+			ret = mod_prop_proc(mod, tvp + i);
+			if (ret < 0)
+				break;
+			(tvp + i)->result = ret;
+		}
+		kfree(tvp);
+		break;
+
+	case FE_GET_PROPERTY:
+		if ((tvps->num == 0) || (tvps->num > DTV_IOCTL_MAX_MSGS)) {
+			ret = -EINVAL;
+			break;
+		}
+		tvp = memdup_user(tvps->props, tvps->num * sizeof(*tvp));
+		if (IS_ERR(tvp)) {
+			ret = PTR_ERR(tvp);
+			break;
+		}
+		for (i = 0; i < tvps->num; i++) {
+			ret = mod_prop_get(mod, tvp + i);
+			if (ret < 0)
+				break;
+			(tvp + i)->result = ret;
+		}
+		if ((ret >= 0) &&
+		    copy_to_user((void __user *)tvps->props, tvp,
+				 tvps->num * sizeof(struct dtv_property)))
+			ret = -EFAULT;
+		kfree(tvp);
+		break;
+
 	case DVB_MOD_SET:
 	{
 		struct dvb_mod_params *mp = parg;
 
-		pr_info("set base freq\n");
-		if (mp->base_frequency != dev->mod_base.frequency)
-			if (set_base_frequency(dev, mp->base_frequency))
-				return -EINVAL;
-		pr_info("set attenuator\n");
+		if (dev->link[0].info->version < 2) {
+			if (mp->base_frequency != dev->mod_base.frequency)
+				if (set_base_frequency(dev, mp->base_frequency)) {
+					ret = -EINVAL;
+					break;
+				}
+		} else {
+			int i, streams = dev->link[0].info->port_num;
+
+			dev->mod_base.frequency = mp->base_frequency;
+			for (i = 0; i < streams; i++) {
+				struct ddb_mod *mod = &dev->mod[i];
+
+				mod->port = &dev->port[i];
+				mod_set_modulation(mod, QAM_256);
+				mod_set_symbolrate(mod, 6900000);
+				mod_set_frequency(mod, dev->mod_base.frequency +
+						  i * 8000000);
+			}
+		}
 		mod_set_attenuator(dev, mp->attenuator);
 		break;
 	}
 	case DVB_MOD_CHANNEL_SET:
 	{
 		struct dvb_mod_channel_params *cp = parg;
+		struct ddb_mod *mod = &dev->mod[output->nr];
 		int res;
-		u32 ri;
 
-		pr_info("set modulation\n");
-		res = mod_set_modulation(dev, output->nr, cp->modulation);
-		if (res)
-			return res;
-
-		if (cp->input_bitrate > dev->mod[output->nr].obitrate)
-			return -EINVAL;
-		dev->mod[output->nr].ibitrate = cp->input_bitrate;
-		dev->mod[output->nr].pcr_correction = cp->pcr_correction;
-
-		pr_info("ibitrate %llu\n", dev->mod[output->nr].ibitrate);
-		pr_info("obitrate %llu\n", dev->mod[output->nr].obitrate);
-		if (cp->input_bitrate != 0) {
-			u64 d = dev->mod[output->nr].obitrate -
-				dev->mod[output->nr].ibitrate;
-
-			d = div64_u64(d, dev->mod[output->nr].obitrate >> 24);
-			if (d > 0xfffffe)
-				ri = 0xfffffe;
-			else
-				ri = d;
-		} else
-			ri = 0;
-		dev->mod[output->nr].rate_inc = ri;
-		pr_info("ibr=%llu, obr=%llu, ri=0x%06x\n",
-			dev->mod[output->nr].ibitrate >> 32,
-			dev->mod[output->nr].obitrate >> 32,
-			ri);
+		res = mod_set_modulation(mod, cp->modulation);
+		if (res) {
+			ret = res;
+			break;
+		}
+		res = mod_set_ibitrate(mod, cp->input_bitrate);
+		if (res) {
+			ret = res;
+			break;
+		}
+		mod->pcr_correction = cp->pcr_correction;
 		break;
 	}
 	default:
 		ret = -EINVAL;
 		break;
 	}
+	mutex_unlock(&dev->ioctl_mutex);
+	return ret;
+}
+
+static int mod_init_2(struct ddb *dev, u32 Frequency)
+{
+	int i, status, streams = dev->link[0].info->port_num;
+
+	dev->mod_base.frequency = Frequency;
+
+	status = mod_fsm_setup(dev, 0);
+	if (status) {
+		dev_err(dev->dev, "FSM setup failed!\n");
+		return -1;
+	}
+	for (i = 0; i < streams; i++) {
+		struct ddb_mod *mod = &dev->mod[i];
+
+		mod->port = &dev->port[i];
+		mod_set_modulation(mod, QAM_256);
+		mod_set_symbolrate(mod, 6900000);
+		mod_set_frequency(mod, dev->mod_base.frequency + i * 8000000);
+	}
+	if (streams <= 8)
+		mod_set_vga(dev, RF_VGA_GAIN_N8);
+	else if (streams <= 16)
+		mod_set_vga(dev, RF_VGA_GAIN_N16);
+	else
+		mod_set_vga(dev, RF_VGA_GAIN_N24);
+
+	udelay(10);
+	mod_set_attenuator(dev, 0);
+	return 0;
+}
+
+
+/****************************************************************************/
+
+static u32 vsb13500[64] = {
+	0x0000000E, 0x00010004, 0x00020003, 0x00030009,
+	0x0004FFFA, 0x00050002, 0x0006FFF8, 0x0007FFF0,
+	0x00080000, 0x0009FFEA, 0x000A0001, 0x000B0003,
+	0x000CFFF9, 0x000D0025,	0x000E0004, 0x000F001F,
+	0x00100023, 0x0011FFEE, 0x00120020, 0x0013FFD0,
+	0x0014FFD5, 0x0015FFED, 0x0016FF8B, 0x0017000B,
+	0x0018FFC8, 0x0019FFF1, 0x001A009E, 0x001BFFEF,
+	0x001C013B, 0x001D00CB, 0x001E0031, 0x001F05F6,
+
+	0x0040FFFF, 0x00410004, 0x0042FFF8, 0x0043FFFE,
+	0x0044FFFA, 0x0045FFF3, 0x00460003, 0x0047FFF4,
+	0x00480005, 0x0049000D, 0x004A0000, 0x004B0022,
+	0x004C0005, 0x004D000D, 0x004E0013, 0x004FFFDF,
+	0x00500007, 0x0051FFD4, 0x0052FFD2, 0x0053FFFD,
+	0x0054FFB7, 0x00550021, 0x00560009, 0x00570010,
+	0x00580097, 0x00590003, 0x005A009D, 0x005B004F,
+	0x005CFF89, 0x005D0097, 0x005EFD42, 0x005FFCBE
+};
+
+static u32 stage2[16] = {
+	0x0080FFFF, 0x00810000, 0x00820005, 0x00830000,
+	0x0084FFF0, 0x00850000, 0x00860029, 0x00870000,
+	0x0088FFA2, 0x0089FFFF, 0x008A00C9, 0x008B000C,
+	0x008CFE49, 0x008DFF9B, 0x008E04D4, 0x008F07FF
+};
+
+static void mod_set_sdr_table(struct ddb_mod *mod, u32 *tab, u32 len)
+{
+	struct ddb *dev = mod->port->dev;
+	u32 i;
+
+	for (i = 0; i < len; i++)
+		ddbwritel(dev, tab[i], SDR_CHANNEL_SETFIR(mod->port->nr));
+}
+
+static int rfdac_init(struct ddb *dev)
+{
+	int i;
+	u32 tmp;
+
+	ddbwritel(dev, RFDAC_CMD_POWERDOWN, RFDAC_CONTROL);
+	for (i = 0; i < 10; i++) {
+		msleep(20);
+		tmp = ddbreadl(dev, RFDAC_CONTROL);
+		if ((tmp & RFDAC_CMD_STATUS) == 0x00)
+			break;
+	}
+	if (tmp & 0x80)
+		return -1;
+	dev_info(dev->dev, "sync %d:%08x\n", i, tmp);
+	ddbwritel(dev, RFDAC_CMD_RESET, RFDAC_CONTROL);
+	for (i = 0; i < 10; i++) {
+		msleep(20);
+		tmp = ddbreadl(dev, RFDAC_CONTROL);
+		if ((tmp & RFDAC_CMD_STATUS) == 0x00)
+			break;
+	}
+	if (tmp & 0x80)
+		return -1;
+	dev_info(dev->dev, "sync %d:%08x\n", i, tmp);
+	ddbwritel(dev, RFDAC_CMD_SETUP, RFDAC_CONTROL);
+	for (i = 0; i < 10; i++) {
+		msleep(20);
+		tmp = ddbreadl(dev, RFDAC_CONTROL);
+		if ((tmp & RFDAC_CMD_STATUS) == 0x00)
+			break;
+	}
+	if (tmp & 0x80)
+		return -1;
+	dev_info(dev->dev, "sync %d:%08x\n", i, tmp);
+	ddbwritel(dev, 0x01, JESD204B_BASE);
+	for (i = 0; i < 400; i++) {
+		msleep(20);
+		tmp = ddbreadl(dev, JESD204B_BASE);
+		if ((tmp & 0xc0000000) == 0xc0000000)
+			break;
+	}
+	dev_info(dev->dev, "sync %d:%08x\n", i, tmp);
+	if ((tmp & 0xc0000000) != 0xc0000000)
+		return -1;
+	return 0;
+}
+
+static int mod_init_3(struct ddb *dev, u32 Frequency)
+{
+	int streams = dev->link[0].info->port_num;
+	int i, ret = 0;
+
+	ret = mod_setup_max2871(dev, max2871_sdr);
+	if (ret)
+		dev_err(dev->dev, "PLL setup failed\n");
+	ret = rfdac_init(dev);
+	if (ret)
+		ret = rfdac_init(dev);
+	if (ret)
+		dev_err(dev->dev, "RFDAC setup failed\n");
+
+	for (i = 0; i < streams; i++) {
+		struct ddb_mod *mod = &dev->mod[i];
+
+		mod->port = &dev->port[i];
+		mod_set_sdr_table(mod, vsb13500, 64);
+		mod_set_sdr_table(mod, stage2, 16);
+	}
+	ddbwritel(dev, 0x1800, 0x244);
+	ddbwritel(dev, 0x01, 0x240);
+
+	mod3_set_base_frequency(dev, 602000000);
+	for (i = 0; i < streams; i++) {
+		struct ddb_mod *mod = &dev->mod[i];
+
+		ddbwritel(dev, 0x00, SDR_CHANNEL_CONTROL(i));
+		ddbwritel(dev, 0x06, SDR_CHANNEL_CONFIG(i));
+		ddbwritel(dev, 0x70800000, SDR_CHANNEL_ARICW(i));
+		mod3_set_frequency(mod, Frequency + 7000000 * i);
+
+		ddbwritel(dev, 0x00011f80, SDR_CHANNEL_RGAIN(i));
+		ddbwritel(dev, 0x00002000, SDR_CHANNEL_FM1GAIN(i));
+		ddbwritel(dev, 0x00001000, SDR_CHANNEL_FM2GAIN(i));
+	}
+	mod_set_attenuator(dev, 0);
+	mod_set_vga(dev, 64);
 	return ret;
 }
 
 int ddbridge_mod_init(struct ddb *dev)
 {
-	return mod_init(dev, 722000000);
+	switch (dev->link[0].info->version) {
+	case 0:
+	case 1:
+		return mod_init_1(dev, 722000000);
+	case 2:
+		return mod_init_2(dev, 114000000);
+	case 3:
+		return mod_init_3(dev, 503250000);
+	default:
+		return -1;
+	}
 }

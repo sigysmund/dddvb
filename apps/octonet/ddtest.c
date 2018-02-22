@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -12,24 +13,11 @@
 
 #include "flash.h"
 
-static uint32_t linknr = 0;
-
 typedef int (*COMMAND_FUNCTION)(int dev, int argc, char* argv[], uint32_t Flags);
 
 enum {
 	REPEAT_FLAG = 0x00000001,
 	SILENT_FLAG = 0x00000002,
-};
-
-enum {
-	UNKNOWN_FLASH = 0,
-	ATMEL_AT45DB642D = 1,
-	SSTI_SST25VF016B = 2,
-	SSTI_SST25VF032B = 3,
-	SSTI_SST25VF064C = 4,
-	SPANSION_S25FL116K = 5,
-	SPANSION_S25FL132K = 6,
-	SPANSION_S25FL164K = 7,
 };
 
 struct SCommand
@@ -42,94 +30,25 @@ struct SCommand
 
 // --------------------------------------------------------------------------------------------
 
-void Dump(const uint8_t *b, uint32_t start, int l)
-{
-	int i, j;
-	
-	for (j = 0; j < l; j += 16, b += 16) { 
-		printf("%08x: ", start + j);
-		for (i = 0; i < 16; i++)
-			if (i + j < l)
-				printf("%02x ", b[i]);
-			else
-				printf("   ");
-		printf(" |");
-		for (i = 0; i < 16; i++)
-			if (i + j < l)
-				putchar((b[i] > 31 && b[i] < 127) ? b[i] : '.');
-		printf("|\n");
-	}
-}
-
-int readreg(int dev, uint32_t RegAddress, uint32_t *pRegValue)
-{
-	struct ddb_reg reg = { .reg = RegAddress };
-	int ret;
-	
-	ret = ioctl(dev, IOCTL_DDB_READ_REG, &reg);
-	if (ret < 0) 
-		return ret;
-	if (pRegValue)
-		*pRegValue = reg.val;
-	return 0;
-}
-
-int writereg(int dev, uint32_t RegAddress, uint32_t RegValue)
-{
-	struct ddb_reg reg = { .reg = RegAddress, .val = RegValue};
-
-	return ioctl(dev, IOCTL_DDB_WRITE_REG, &reg);
-}
-
-int FlashIO(int ddb, uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen)
-{
-	struct ddb_flashio fio = {
-		.write_buf=wbuf,
-		.write_len=wlen,
-		.read_buf=rbuf,
-		.read_len=rlen,
-		.link=linknr,
-	};
-	
-	return ioctl(ddb, IOCTL_DDB_FLASHIO, &fio);
-}
-
-int flashread(int ddb, uint8_t *buf, uint32_t addr, uint32_t len)
-{
-	int ret;
-	uint8_t cmd[4];
-	uint32_t l;
-
-	while (len) {
-		cmd[0] = 3;
-		cmd[1] = (addr >> 16) & 0xff;
-		cmd[2] = (addr >> 8) & 0xff;
-		cmd[3] = addr & 0xff;
-		
-		if (len > 1024)
-			l = 1024;
-		else
-			l = len;
-		ret = FlashIO(ddb, cmd, 4, buf, l);
-		if (ret < 0)
-			return ret;
-		addr += l;
-		buf += l;
-		len -= l;
-	}
-	return 0;
-}
 
 int ReadFlash(int ddb, int argc, char *argv[], uint32_t Flags)
 {
 	uint32_t Start;
 	uint32_t Len;
 	uint8_t *Buffer;
+	int fd;
 
 	if (argc < 2 ) 
 		return -1;
 	Start = strtoul(argv[0],NULL,16);
 	Len   = strtoul(argv[1],NULL,16);
+	if (argc == 3) {
+		fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC);
+		if (fd < 0) {
+			printf("Could not open file %s\n", argv[2]);
+			return -1;
+		}
+	}
 	
 	Buffer = malloc(Len);
 	if (flashread(ddb, Buffer, Start, Len) < 0) {
@@ -138,68 +57,42 @@ int ReadFlash(int ddb, int argc, char *argv[], uint32_t Flags)
 		return 0;
 	}
 	
-	Dump(Buffer,Start,Len);
+	if (argc == 3) {
+		write(fd, Buffer, Len);
+		close(fd);
+	} else
+		Dump(Buffer,Start,Len);
 	
 	free(Buffer);
 	return 0;
 }
 
 
-
-int FlashDetect(int dev)
+int ReadSave(int ddb, int argc, char *argv[], uint32_t Flags)
 {
-	uint8_t Cmd = 0x9F;
-	uint8_t Id[3];
-	
-	int r = FlashIO(dev, &Cmd, 1, Id, 3);
-	if (r < 0) 
-		return r;
-	
-	if (Id[0] == 0xBF && Id[1] == 0x25 && Id[2] == 0x41)
-		r = SSTI_SST25VF016B; 
-	else if (Id[0] == 0xBF && Id[1] == 0x25 && Id[2] == 0x4A)
-		r = SSTI_SST25VF032B; 
-	else if ( Id[0] == 0xBF && Id[1] == 0x25 && Id[2] == 0x4B )
-		r = SSTI_SST25VF064C; 
-	else if ( Id[0] == 0x01 && Id[1] == 0x40 && Id[2] == 0x15 )
-		r = SPANSION_S25FL116K; 
-	else if ( Id[0] == 0x01 && Id[1] == 0x40 && Id[2] == 0x16 )
-		r = SPANSION_S25FL132K; 
-	else if ( Id[0] == 0x01 && Id[1] == 0x40 && Id[2] == 0x17 )
-		r = SPANSION_S25FL164K; 
-	else if ( Id[0] == 0x1F && Id[1] == 0x28)
-		r = ATMEL_AT45DB642D; 
-	else 
-		r = UNKNOWN_FLASH;
-	
-	switch(r) {
-        case UNKNOWN_FLASH : 
-		printf("Unknown Flash Flash ID = %02x %02x %02x\n",Id[0],Id[1],Id[2]); 
-		break;
-        case ATMEL_AT45DB642D : 
-		printf("Flash: Atmel AT45DB642D  64 MBit\n"); 
-		break;
-        case SSTI_SST25VF016B : 
-		printf("Flash: SSTI  SST25VF016B 16 MBit\n"); 
-		break;
-        case SSTI_SST25VF032B : 
-		printf("Flash: SSTI  SST25VF032B 32 MBit\n"); 
-		break;
-        case SSTI_SST25VF064C :
-		printf("Flash: SSTI  SST25VF064C 64 MBit\n");
-		break;
-        case SPANSION_S25FL116K : 
-		printf("Flash: SPANSION S25FL116K 16 MBit\n"); 
-		break;
-        case SPANSION_S25FL132K : 
-		printf("Flash: SPANSION S25FL132K 32 MBit\n"); 
-		break;
-        case SPANSION_S25FL164K : 
-		printf("Flash: SPANSION S25FL164K 64 MBit\n"); 
-		break;
+	uint32_t Start;
+	uint32_t Len;
+	uint8_t *Buffer;
+	int fd;
+
+	if (argc < 3 ) 
+		return -1;
+	Start = strtoul(argv[0],NULL,16);
+	Len   = strtoul(argv[1],NULL,16);
+		
+	Buffer = malloc(Len);
+	if (flashread(ddb, Buffer, Start, Len) < 0) {
+		printf("flashread error\n");
+		free(Buffer);
+		return 0;
 	}
-	return r;
+
+	
+		
+	free(Buffer);
+	return 0;
 }
+
 
 int FlashChipEraseAtmel(int dev)
 {
@@ -215,12 +108,12 @@ int FlashChipEraseAtmel(int dev)
 		Cmd[1] = ( (( i ) >> 16) & 0xFF );
 		Cmd[2] = ( (( i ) >>  8) & 0xFF );
 		Cmd[3] = 0x00;
-		err = FlashIO(dev,Cmd,4,NULL,0);
+		err = flashio(dev,Cmd,4,NULL,0);
 		if( err < 0 ) 
 			break;
 		while (1) {
 			Cmd[0] = 0xD7;  // Read Status register
-			err = FlashIO(dev,Cmd,1,&Cmd[0],1);
+			err = flashio(dev,Cmd,1,&Cmd[0],1);
 			if( err < 0 ) break;
 			if( (Cmd[0] & 0x80) == 0x80 ) break;
 		}
@@ -238,25 +131,25 @@ int FlashChipEraseSSTI(int dev)
 	
 	do {
 		Cmd[0] = 0x50;  // EWSR
-		err = FlashIO(dev,Cmd,1,NULL,0);
+		err = flashio(dev,Cmd,1,NULL,0);
 		if( err < 0 ) break;
 		
 		Cmd[0] = 0x01;  // WRSR
 		Cmd[1] = 0x00;  // BPx = 0, Unlock all blocks
-		err = FlashIO(dev,Cmd,2,NULL,0);
+		err = flashio(dev,Cmd,2,NULL,0);
 		if( err < 0 ) break;
 		
 		Cmd[0] = 0x06;  // WREN
-		err = FlashIO(dev,Cmd,1,NULL,0);
+		err = flashio(dev,Cmd,1,NULL,0);
 		if( err < 0 ) break;
 		
 		Cmd[0] = 0x60;  // CHIP Erase
-		err = FlashIO(dev,Cmd,1,NULL,0);
+		err = flashio(dev,Cmd,1,NULL,0);
 		if( err < 0 ) break;
 		
 		while(1) {
 			Cmd[0] = 0x05;  // RDRS
-			err = FlashIO(dev,Cmd,1,&Cmd[0],1);
+			err = flashio(dev,Cmd,1,&Cmd[0],1);
 			if( err < 0 ) break;
 			if( (Cmd[0] & 0x01) == 0 ) break;
 		}
@@ -264,12 +157,12 @@ int FlashChipEraseSSTI(int dev)
 			break;
 		
 		Cmd[0] = 0x50;  // EWSR
-		err = FlashIO(dev,Cmd,1,NULL,0);
+		err = flashio(dev,Cmd,1,NULL,0);
 		if( err < 0 ) break;
 		
 		Cmd[0] = 0x01;  // WRSR
 		Cmd[1] = 0x1C;  // BPx = 0, Lock all blocks
-		err = FlashIO(dev,Cmd,2,NULL,0);
+		err = flashio(dev,Cmd,2,NULL,0);
 	}
 	while(0);
 	
@@ -279,286 +172,6 @@ int FlashChipEraseSSTI(int dev)
 }
 
 
-int FlashWriteAtmel(int dev,uint32_t FlashOffset,uint8_t * Buffer,int BufferSize)
-{
-	int err = 0, i;
-	int BlockErase = BufferSize >= 8192;
-	uint8_t Cmd[4];
-	
-	if( BlockErase ) {
-		for(i = 0; i < BufferSize; i += 8192 ) {
-			if( (i & 0xFFFF) == 0 )
-			{
-				printf(" Erase    %08x\n",FlashOffset + i);
-			}
-			Cmd[0] = 0x50; // Block Erase
-			Cmd[1] = ( (( FlashOffset + i ) >> 16) & 0xFF );
-			Cmd[2] = ( (( FlashOffset + i ) >>  8) & 0xFF );
-			Cmd[3] = 0x00;
-			err = FlashIO(dev,Cmd,4,NULL,0);
-			if( err < 0 ) break;
-			
-			while(1) {
-				Cmd[0] = 0xD7;  // Read Status register
-				err = FlashIO(dev,Cmd,1,&Cmd[0],1);
-				if( err < 0 ) break;
-				if( (Cmd[0] & 0x80) == 0x80 ) break;
-			}
-		}
-	}
-	
-	for(i = 0; i < BufferSize; i += 1024 )
-	{
-		if( (i & 0xFFFF) == 0 )
-		{
-			printf(" Programm %08x\n",FlashOffset + i);
-		}
-		uint8_t Cmd[4 + 1024];
-		Cmd[0] = 0x84; // Buffer 1
-		Cmd[1] = 0x00;
-		Cmd[2] = 0x00;
-		Cmd[3] = 0x00;
-		memcpy(&Cmd[4],&Buffer[i],1024);
-		
-		err = FlashIO(dev,Cmd,4 + 1024,NULL,0);
-		if( err < 0 ) break;
-		
-		Cmd[0] = BlockErase ? 0x88 : 0x83; // Buffer to Main Memory (with Erase)
-		Cmd[1] = ( (( FlashOffset + i ) >> 16) & 0xFF );
-		Cmd[2] = ( (( FlashOffset + i ) >>  8) & 0xFF );
-		Cmd[3] = 0x00;
-		
-		err = FlashIO(dev,Cmd,4,NULL,0);
-		if( err < 0 ) break;
-		
-		while(1)
-		{
-			Cmd[0] = 0xD7;  // Read Status register
-			err = FlashIO(dev,Cmd,1,&Cmd[0],1);
-			if( err < 0 ) break;
-			if( (Cmd[0] & 0x80) == 0x80 ) break;
-		}
-		if( err < 0 ) break;
-	}
-	return err;
-}
-
-// **************************************************************************************
-// BUG: Erasing and writing an incomplete image will result in an failure to boot golden image.
-// FIX: Write the new image from high to low addresses
-
-int FlashWriteSSTI(int dev,uint32_t FlashOffset,uint8_t * Buffer,int BufferSize)
-{
-	int err = 0, i, j;
-	uint8_t Cmd[6];
-	
-	if( (BufferSize % 4096) != 0 ) return -1;   // Must be multiple of sector size
-	
-	do
-	{
-		Cmd[0] = 0x50;  // EWSR
-		err = FlashIO(dev,Cmd,1,NULL,0);
-		if( err < 0 ) break;
-		
-		Cmd[0] = 0x01;  // WRSR
-		Cmd[1] = 0x00;  // BPx = 0, Unlock all blocks
-		err = FlashIO(dev,Cmd,2,NULL,0);
-		if( err < 0 ) break;
-		
-		for (i = 0; i < BufferSize; i += 4096 )
-		{
-			if( (i & 0xFFFF) == 0 )
-			{
-				printf(" Erase    %08x\n",FlashOffset + i);
-			}
-			
-			Cmd[0] = 0x06;  // WREN
-			err = FlashIO(dev,Cmd,1,NULL,0);
-			if( err < 0 ) break;
-			
-			Cmd[0] = 0x20;  // Sector erase ( 4Kb)
-			Cmd[1] = ( (( FlashOffset + i ) >> 16) & 0xFF );
-			Cmd[2] = ( (( FlashOffset + i ) >>  8) & 0xFF );
-			Cmd[3] = 0x00;
-			err = FlashIO(dev,Cmd,4,NULL,0);
-			if( err < 0 ) break;
-			
-			while(1)
-			{
-				Cmd[0] = 0x05;  // RDRS
-				err = FlashIO(dev,Cmd,1,&Cmd[0],1);
-				if( err < 0 ) break;
-				if( (Cmd[0] & 0x01) == 0 ) break;
-			}
-			if( err < 0 ) break;
-			
-		}
-		if( err < 0 ) break;
-		
-		
-		for (j = BufferSize - 4096; j >= 0; j -= 4096 )
-		{
-			if( (j & 0xFFFF) == 0 )
-			{
-				printf(" Programm %08x\n",FlashOffset + j);
-			}
-			
-			for (i = 0; i < 4096; i += 2 )
-			{
-				
-				if( i == 0 )
-				{
-					Cmd[0] = 0x06;  // WREN
-					err = FlashIO(dev,Cmd,1,NULL,0);
-					if( err < 0 ) break;
-					
-					Cmd[0] = 0xAD;  // AAI
-					Cmd[1] = ( (( FlashOffset + j ) >> 16) & 0xFF );
-					Cmd[2] = ( (( FlashOffset + j ) >>  8) & 0xFF );
-					Cmd[3] = 0x00;
-					Cmd[4] = Buffer[j+i];
-					Cmd[5] = Buffer[j+i+1];
-					err = FlashIO(dev,Cmd,6,NULL,0);
-				}
-				else
-				{
-					Cmd[0] = 0xAD;  // AAI
-					Cmd[1] = Buffer[j+i];
-					Cmd[2] = Buffer[j+i+1];
-					err = FlashIO(dev,Cmd,3,NULL,0);
-				}
-				if( err < 0 ) break;
-				
-				while(1)
-				{
-					Cmd[0] = 0x05;  // RDRS
-					err = FlashIO(dev,Cmd,1,&Cmd[0],1);
-					if( err < 0 ) break;
-					if( (Cmd[0] & 0x01) == 0 ) break;
-				}
-				if( err < 0 ) break;
-			}
-			if( err < 0 ) break;
-			
-			Cmd[0] = 0x04;  // WDIS
-			err = FlashIO(dev,Cmd,1,NULL,0);
-			if( err < 0 ) break;
-			
-		}
-		if( err < 0 ) break;
-		
-		
-		Cmd[0] = 0x50;  // EWSR
-		err = FlashIO(dev,Cmd,1,NULL,0);
-		if( err < 0 ) break;
-		
-		Cmd[0] = 0x01;  // WRSR
-		Cmd[1] = 0x1C;  // BPx = 0, Lock all blocks
-		err = FlashIO(dev,Cmd,2,NULL,0);
-		
-	}
-	while(0);
-	return err;
-}
-
-
-
-int FlashWritePageMode(int dev, uint32_t FlashOffset,
-		       uint8_t *Buffer,int BufferSize,uint8_t LockBits)
-{
-    int err = 0;
-    uint8_t Cmd[260];
-    int i, j;
-    
-    if( (BufferSize % 4096) != 0 ) return -1;   // Must be multiple of sector size
-
-    do
-    {
-        Cmd[0] = 0x50;  // EWSR
-        err = FlashIO(dev,Cmd,1,NULL,0);
-        if( err < 0 ) break;
-
-        Cmd[0] = 0x01;  // WRSR
-        Cmd[1] = 0x00;  // BPx = 0, Unlock all blocks
-        err = FlashIO(dev,Cmd,2,NULL,0);
-        if( err < 0 ) break;
-
-        for(i = 0; i < BufferSize; i += 4096 )
-        {
-            if( (i & 0xFFFF) == 0 )
-            {
-                printf(" Erase    %08x\n",FlashOffset + i);
-            }
-
-            Cmd[0] = 0x06;  // WREN
-            err = FlashIO(dev,Cmd,1,NULL,0);
-            if( err < 0 ) break;
-
-            Cmd[0] = 0x20;  // Sector erase ( 4Kb)
-            Cmd[1] = ( (( FlashOffset + i ) >> 16) & 0xFF );
-            Cmd[2] = ( (( FlashOffset + i ) >>  8) & 0xFF );
-            Cmd[3] = 0x00;
-            err = FlashIO(dev,Cmd,4,NULL,0);
-            if( err < 0 ) break;
-
-            while(1)
-            {
-                Cmd[0] = 0x05;  // RDRS
-                err = FlashIO(dev,Cmd,1,&Cmd[0],1);
-                if( err < 0 ) break;
-                if( (Cmd[0] & 0x01) == 0 ) break;
-            }
-            if( err < 0 ) break;
-
-        }
-        if( err < 0 ) break;
-
-
-        for(j = BufferSize - 256; j >= 0; j -= 256 )
-        {
-            if( (j & 0xFFFF) == 0 )
-            {
-                printf(" Programm %08x\n",FlashOffset + j);
-            }
-
-            Cmd[0] = 0x06;  // WREN
-            err = FlashIO(dev,Cmd,1,NULL,0);
-            if( err < 0 ) break;
-
-            Cmd[0] = 0x02;  // PP
-            Cmd[1] = ( (( FlashOffset + j ) >> 16) & 0xFF );
-            Cmd[2] = ( (( FlashOffset + j ) >>  8) & 0xFF );
-            Cmd[3] = 0x00;
-            memcpy(&Cmd[4],&Buffer[j],256);
-            err = FlashIO(dev,Cmd,260,NULL,0);
-            if( err < 0 ) break;
-
-            while(1)
-            {
-                Cmd[0] = 0x05;  // RDRS
-                err = FlashIO(dev,Cmd,1,&Cmd[0],1);
-                if( err < 0 ) break;
-                if( (Cmd[0] & 0x01) == 0 ) break;
-            }
-            if( err < 0 ) break;
-
-        }
-        if( err < 0 ) break;
-
-        Cmd[0] = 0x50;  // EWSR
-        err = FlashIO(dev,Cmd,1,NULL,0);
-        if( err < 0 ) break;
-
-        Cmd[0] = 0x01;  // WRSR
-        Cmd[1] = LockBits;  // BPx = 0, Lock all blocks
-        err = FlashIO(dev,Cmd,2,NULL,0);
-
-    }
-    while(0);
-    return err;
-}
-
-// --------------------------------------------------------------------------------------------
 
 int ReadDeviceMemory(int dev,int argc, char* argv[],uint32_t Flags)
 {
@@ -694,7 +307,7 @@ int GetSetRegister(int dev,int argc, char* argv[],uint32_t Flags)
 // -----------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------
 
-int FlashIOC(int dev,int argc, char* argv[],uint32_t Flags)
+int flashioc(int dev,int argc, char* argv[],uint32_t Flags)
 {
     uint8_t *Buffer;
     uint32_t tmp = 0, i;
@@ -719,7 +332,7 @@ int FlashIOC(int dev,int argc, char* argv[],uint32_t Flags)
         Buffer[i] = (uint8_t) tmp;
     }
 
-    if( FlashIO(dev,Buffer,WriteLen,Buffer,ReadLen) < 0 )
+    if( flashio(dev,Buffer,WriteLen,Buffer,ReadLen) < 0 )
     {
         return 0;
     }
@@ -763,7 +376,6 @@ uint32_t   GetFPGA_ID(uint8_t * Buffer)
 
     return ID;
 }
-
 
 
 int FlashProg(int dev,int argc, char* argv[],uint32_t Flags)
@@ -1652,6 +1264,174 @@ int lic_erase(int dev, int argc, char* argv[], uint32_t Flags)
 	return err;
 }
 
+static int read_sfpd(int dev, uint8_t adr, uint8_t *val)
+{
+	uint8_t cmd[5] = { 0x5a, 0, 0, adr, 00 };     
+	int r;
+	
+	r = flashio(dev, cmd, 5, val, 1);
+	if (r < 0)
+		return r;
+	return 0;
+}
+
+static int read_sst_id(int dev, uint8_t *id)
+{
+	uint8_t cmd[2] = { 0x88, 0 };
+	uint8_t buf[9];
+	int r;
+	
+	r = flashio(dev, cmd, 2, buf, 9);
+	if (r < 0)
+		return r;
+	memcpy(id, buf + 1, 8);
+	return 0;
+}
+
+int read_id(int dev, int argc, char* argv[], uint32_t Flags)
+{
+	int Flash = FlashDetect(dev);
+	uint8_t Cmd;;
+	uint8_t Id[8];
+	uint32_t len, i, adr;
+	
+
+	switch(Flash) {
+        case SPANSION_S25FL116K:
+        case SPANSION_S25FL132K:
+        case SPANSION_S25FL164K:
+		for (i = 0; i < 8; i++)
+			read_sfpd(dev, 0xf8 + i, &Id[i]);
+		len = 8;
+		break;
+	case SSTI_SST25VF064C:
+		read_sst_id(dev, Id);
+		len = 8;
+		break;
+        default:
+		printf("Unsupported Flash\n");
+		return -1;
+	}
+	printf("ID: ");
+	for (i = 0; i < len; i++)
+		printf("%02x ", Id[i]);
+	printf("\n");
+
+}
+
+int i2cread(int dev, int argc, char* argv[], uint32_t Flags)
+{
+	uint8_t BusNumber     = 0;
+	uint8_t DeviceAddress = 0;
+	int i;
+	uint32_t tmp;
+	char *p;
+	uint32_t BufferLength;
+	uint32_t ReadLen;
+	uint8_t *Buffer;
+	int Repeat = (Flags & REPEAT_FLAG) != 0;
+	int Silent = (Flags & SILENT_FLAG) != 0;
+	
+	if (argc < 2)
+		return -1;
+	
+	tmp = strtoul(argv[0],&p,16);
+	if (tmp > 255)
+		return -1;
+	
+	if (*p == ':') {
+		BusNumber = (uint8_t) (tmp - 1);
+		tmp = strtoul(&p[1],NULL,16);
+	}
+	if (tmp > 255 || BusNumber > 3)
+		return -1;
+	
+	DeviceAddress = (uint8_t) tmp;
+	BufferLength = (argc-2);
+	ReadLen = strtoul(argv[argc-1],NULL,0);
+	if (ReadLen > BufferLength)
+		BufferLength = ReadLen ;
+	
+	printf(" BufferLength = %d tmp = %d\n", BufferLength, ReadLen);
+	Buffer = malloc(BufferLength);
+	
+	for (i = 1; i < (argc-1); i += 1 ) {
+		tmp = strtoul(argv[i],NULL,16);
+		if (tmp > 255) {
+			free(Buffer);
+			return -1;
+		}
+		Buffer[i-1] = (uint8_t) tmp;
+	}
+	
+	do {
+		int hr = i2c_read(dev, BusNumber, DeviceAddress, Buffer, argc-2, Buffer, ReadLen);
+		if (hr < 0) {
+			printf("ioctl error\n");
+			free(Buffer);
+			return 0;
+		}
+		if (!Silent) {
+			printf("OK\n");
+			Dump(&Buffer[0],0,ReadLen);
+		}
+	} while (Repeat);
+	free(Buffer);
+	return 0;
+}
+
+int i2cwrite(int dev, int argc, char* argv[], uint32_t Flags)
+{
+    uint8_t BusNumber     = 0;
+    uint8_t DeviceAddress = 0;
+    uint32_t tmp;
+    char *p;
+    uint8_t *Buffer;
+    int i;
+    int Repeat = (Flags & REPEAT_FLAG) != 0;
+    int Silent = (Flags & SILENT_FLAG) != 0;
+
+    
+    if( argc < 1 )
+		return -1;
+    tmp = strtoul(argv[0],&p,16);
+    if( tmp > 255 )
+	    return -1;
+
+    if (*p == ':') {
+	    BusNumber = (uint8_t) (tmp - 1);
+	    tmp = strtoul(&p[1],NULL,16);
+    }
+    if( tmp > 255 || BusNumber > 3)
+	    return -1;
+
+    DeviceAddress = (uint8_t) tmp;
+    Buffer = malloc(argc - 1);
+
+    for (i = 1; i < argc; i += 1)  {
+        tmp = strtoul(argv[i],NULL,16);
+        if (tmp > 255 ) {
+		free(Buffer);
+		return -1;
+        }
+        Buffer[i-1] = (uint8_t) tmp;
+    }
+
+    do {
+	    int hr =i2c_write(dev, BusNumber,DeviceAddress,NULL,0,Buffer,argc-1);
+	    if (hr < 0) {
+		    printf("ioctl error\n");
+		    free(Buffer);
+		    return 0;
+	    }
+	    if( !Silent )
+		    printf("OK\n");
+    } while( Repeat );
+
+    free(Buffer);
+    return 0;
+}
+
 
 struct SCommand CommandTable[] = 
 {
@@ -1660,13 +1440,13 @@ struct SCommand CommandTable[] =
 	{ "memwrite",   WriteDeviceMemory,  1,   "Write Device Memory  : memwrite <start> <values(8)> .." },
 	{ "register",   GetSetRegister,     1,   "Get/Set Register     : reg <regname>|<[0x]regnum> [[0x]value(32)]" },
 	
-	{ "flashread",    ReadFlash,        1,   "Read Flash           : flashread <start> <count>" },
-	{ "flashio",      FlashIO,          1,   "Flash IO             : flashio <write data>.. <read count>" },
+	{ "flashread",    ReadFlash,        1,   "Read Flash           : flashread <start> <count> [<Filename>]" },
+	{ "flashio",      flashioc,          1,   "Flash IO             : flashio <write data>.. <read count>" },
 	{ "flashprog",    FlashProg,        1,   "Flash Programming    : flashprog <FileName> [<address>]" },
 	{ "flashprog",    FlashProg,        1,   "Flash Programming    : flashprog -SubVendorID <id>" },
 	{ "flashprog",    FlashProg,        1,   "Flash Programming    : flashprog -Jump <address>" },
 	{ "flashverify",  FlashVerify,      1,   "Flash Verify         : flashverify <FileName>  [<address>]" },
-	{ "flasherase",   FlashErase,       1,   "FlashErase           : flasherase" },
+	//{ "flasherase",   FlashErase,       1,   "FlashErase           : flasherase" },
 	//{ "flashtest",    FlashTest,        1,   "FlashTest            : flashtest" },
 
 
@@ -1676,6 +1456,9 @@ struct SCommand CommandTable[] =
 	{ "licimport",   lic_import,       1,   "License Import           : licimport" },
 	{ "licexport",   lic_export,       1,   "License Export           : licexport" },
 	{ "licerase",    lic_erase,        1,   "License Erase            : licerase"  },
+	{ "read_id",    read_id,        1,      "Read Unique ID           : read_id"  },
+	{ "i2cread",    i2cread,        1,     "I2C Read : I2CRead  <[BusNumber:]DeviceAddress> [<write data>..] <read count>" },
+	{ "i2write",    i2cwrite,        1,    "I2C Write            : I2CWrite <[BusNumber:]DeviceAddress> [<write data>..]"},
  	{ NULL,NULL,0 }
 };
 

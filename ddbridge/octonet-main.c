@@ -1,7 +1,7 @@
 /*
  * octonet.c: Digital Devices network tuner driver
  *
- * Copyright (C) 2012-15 Digital Devices GmbH
+ * Copyright (C) 2012-17 Digital Devices GmbH
  *                       Marcus Metzler <mocm@metzlerbros.de>
  *                       Ralph Metzler <rjkm@metzlerbros.de>
  *
@@ -17,95 +17,12 @@
  *
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA
- * Or, point your browser to http://www.gnu.org/copyleft/gpl.html
+ * along with this program; if not, point your browser to
+ *  http://www.gnu.org/copyleft/gpl.html
  */
 
 #include "ddbridge.h"
-#include "ddbridge-regs.h"
-#include <asm-generic/pci-dma-compat.h>
-
-static int adapter_alloc = 3;
-module_param(adapter_alloc, int, 0444);
-MODULE_PARM_DESC(adapter_alloc,
-"0-one adapter per io, 1-one per tab with io, 2-one per tab, 3-one for all");
-
-#include "ddbridge-core.c"
-
-static struct ddb_regset octopus_i2c = {
-	.base = 0x80,
-	.num  = 0x04,
-	.size = 0x20,
-};
-
-static struct ddb_regset octopus_i2c_buf = {
-	.base = 0x1000,
-	.num  = 0x04,
-	.size = 0x200,
-};
-
-static struct ddb_regmap octopus_net_map = {
-	.i2c = &octopus_i2c,
-	.i2c_buf = &octopus_i2c_buf,
-};
-
-static struct ddb_regset octopus_gtl = {
-	.base = 0x180,
-	.num  = 0x01,
-	.size = 0x20,
-};
-
-static struct ddb_regmap octopus_net_gtl = {
-	.i2c = &octopus_i2c,
-	.i2c_buf = &octopus_i2c_buf,
-	.gtl = &octopus_gtl,
-};
-
-static struct ddb_info ddb_octonet = {
-	.type     = DDB_OCTONET,
-	.name     = "Digital Devices OctopusNet network DVB adapter",
-	.regmap   = &octopus_net_map,
-	.port_num = 4,
-	.i2c_mask = 0x0f,
-	.ns_num   = 12,
-	.mdio_num = 1,
-};
-
-static struct ddb_info ddb_octonet_jse = {
-	.type     = DDB_OCTONET,
-	.name     = "Digital Devices OctopusNet network DVB adapter JSE",
-	.regmap   = &octopus_net_map,
-	.port_num = 4,
-	.i2c_mask = 0x0f,
-	.ns_num   = 15,
-	.mdio_num = 1,
-};
-
-static struct ddb_info ddb_octonet_gtl = {
-	.type     = DDB_OCTONET,
-	.name     = "Digital Devices OctopusNet GTL",
-	.regmap   = &octopus_net_gtl,
-	.port_num = 4,
-	.i2c_mask = 0x05,
-	.ns_num   = 12,
-	.mdio_num = 1,
-	.con_clock = 1,
-};
-
-static struct ddb_info ddb_octonet_tbd = {
-	.type     = DDB_OCTONET,
-	.name     = "Digital Devices OctopusNet",
-	.regmap   = &octopus_net_map,
-};
-
-static void octonet_unmap(struct ddb *dev)
-{
-	if (dev->regs)
-		iounmap(dev->regs);
-	vfree(dev);
-}
+#include "ddbridge-io.h"
 
 static int __exit octonet_remove(struct platform_device *pdev)
 {
@@ -124,7 +41,7 @@ static int __exit octonet_remove(struct platform_device *pdev)
 
 	free_irq(platform_get_irq(dev->pfdev, 0), dev);
 	ddb_ports_release(dev);
-	octonet_unmap(dev);
+	ddb_unmap(dev);
 	platform_set_drvdata(pdev, 0);
 	return 0;
 }
@@ -134,9 +51,8 @@ static int __init octonet_probe(struct platform_device *pdev)
 	struct ddb *dev;
 	struct resource *regs;
 	int irq;
-	int i;
 
-	dev = vzalloc(sizeof(struct ddb));
+	dev = vzalloc(sizeof(*dev));
 	if (!dev)
 		return -ENOMEM;
 	platform_set_drvdata(pdev, dev);
@@ -149,7 +65,7 @@ static int __init octonet_probe(struct platform_device *pdev)
 		return -ENXIO;
 	dev->regs_len = (regs->end - regs->start) + 1;
 	dev_info(dev->dev, "regs_start=%08x regs_len=%08x\n",
-		 (u32) regs->start, (u32) dev->regs_len);
+		 (u32)regs->start, (u32)dev->regs_len);
 	dev->regs = ioremap(regs->start, dev->regs_len);
 
 	if (!dev->regs) {
@@ -168,33 +84,25 @@ static int __init octonet_probe(struct platform_device *pdev)
 	dev->link[0].ids.subdevice = dev->link[0].ids.devid >> 16;
 
 	dev->link[0].dev = dev;
-	if (dev->link[0].ids.devid == 0x0300dd01)
-		dev->link[0].info = &ddb_octonet;
-	else if (dev->link[0].ids.devid == 0x0301dd01)
-		dev->link[0].info = &ddb_octonet_jse;
-	else if (dev->link[0].ids.devid == 0x0307dd01)
-		dev->link[0].info = &ddb_octonet_gtl;
-	else
-		dev->link[0].info = &ddb_octonet_tbd;
-
-	pr_info("HW  %08x REGMAP %08x\n",
-		dev->link[0].ids.hwid, dev->link[0].ids.regmapid);
-	pr_info("MAC %08x DEVID  %08x\n",
-		dev->link[0].ids.mac, dev->link[0].ids.devid);
+	dev->link[0].info = get_ddb_info(dev->link[0].ids.vendor,
+					 dev->link[0].ids.device,
+					 0xdd01, 0xffff);
+	dev_info(dev->dev, "DDBridge: HW  %08x REGMAP %08x\n",
+		 dev->link[0].ids.hwid, dev->link[0].ids.regmapid);
+	dev_info(dev->dev, "DDBridge: MAC %08x DEVID  %08x\n",
+		 dev->link[0].ids.mac, dev->link[0].ids.devid);
 
 	ddbwritel(dev, 0, ETHER_CONTROL);
 	ddbwritel(dev, 0x00000000, INTERRUPT_ENABLE);
 	ddbwritel(dev, 0xffffffff, INTERRUPT_STATUS);
-	for (i = 0; i < 16; i++)
-		ddbwritel(dev, 0x00, TS_OUTPUT_CONTROL(i));
-	usleep_range(5000, 6000);
+	ddb_reset_ios(dev);
 
 	irq = platform_get_irq(dev->pfdev, 0);
 	if (irq < 0)
 		goto fail;
-	if (request_irq(irq, irq_handler,
+	if (request_irq(irq, ddb_irq_handler,
 			IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
-			"octonet-dvb", (void *) dev) < 0)
+			"octonet-dvb", (void *)dev) < 0)
 		goto fail;
 	ddbwritel(dev, 0x0fffff0f, INTERRUPT_ENABLE);
 
@@ -205,7 +113,7 @@ fail:
 	dev_err(dev->dev, "fail\n");
 	ddbwritel(dev, 0, ETHER_CONTROL);
 	ddbwritel(dev, 0, INTERRUPT_ENABLE);
-	octonet_unmap(dev);
+	ddb_unmap(dev);
 	platform_set_drvdata(pdev, 0);
 	return -1;
 }
@@ -219,7 +127,7 @@ static const struct of_device_id octonet_dt_ids[] = {
 MODULE_DEVICE_TABLE(of, octonet_dt_ids);
 #endif
 
-static struct platform_driver octonet_driver = {
+static struct platform_driver octonet_driver __refdata = {
 	.remove	= __exit_p(octonet_remove),
 	.probe	= octonet_probe,
 	.driver		= {
@@ -233,25 +141,23 @@ static struct platform_driver octonet_driver = {
 
 static __init int init_octonet(void)
 {
-	int res;
+	int stat;
 
-	pr_info("Digital Devices OctopusNet driver " DDBRIDGE_VERSION
-		", Copyright (C) 2010-15 Digital Devices GmbH\n");
-	res = ddb_class_create();
-	if (res)
-		return res;
-	res = platform_driver_probe(&octonet_driver, octonet_probe);
-	if (res) {
-		ddb_class_destroy();
-		return res;
-	}
-	return 0;
+	pr_info("DDBridge: Digital Devices OctopusNet driver " DDBRIDGE_VERSION
+		", Copyright (C) 2010-17 Digital Devices GmbH\n");
+	stat = ddb_init_ddbridge();
+	if (stat < 0)
+		return stat;
+	stat = platform_driver_probe(&octonet_driver, octonet_probe);
+	if (stat < 0)
+		ddb_exit_ddbridge(0, stat);
+	return stat;
 }
 
 static __exit void exit_octonet(void)
 {
 	platform_driver_unregister(&octonet_driver);
-	ddb_class_destroy();
+	ddb_exit_ddbridge(0, 0);
 }
 
 module_init(init_octonet);
@@ -260,4 +166,4 @@ module_exit(exit_octonet);
 MODULE_DESCRIPTION("GPL");
 MODULE_AUTHOR("Marcus and Ralph Metzler, Metzler Brothers Systementwicklung GbR");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.6");
+MODULE_VERSION(DDBRIDGE_VERSION);
